@@ -189,6 +189,13 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
         group["energy_diff"] = group["energy"].diff()
         group["time_diff"] = group["timestamp"].diff().dt.total_seconds() / 3600  # in hours
         
+        # Calculate the actual difference between first and last readings
+        first_reading = group["energy"].iloc[0]
+        last_reading = group["energy"].iloc[-1]
+        actual_difference = max(0, last_reading - first_reading)  # Ensure non-negative
+        
+        log.info(f"Device {device} - Actual difference: {actual_difference:.2f} kWh")
+        
         device_anomalies = []
         
         # Identify large negative jumps (potential resets)
@@ -241,6 +248,29 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
             })
             
             all_anomalies.extend(device_anomalies)
+            
+            # Enforce constraint if configured
+            if CONFIG["energy_analysis"].get("enforce_total_constraint", True):
+                tolerance = CONFIG["energy_analysis"].get("constraint_tolerance", 0.05)
+                max_allowed = actual_difference * (1 + tolerance)
+                
+                if total_consumption > max_allowed:
+                    anomaly = log_anomaly(
+                        device_id=device,
+                        anomaly_type="total_constraint",
+                        original_value=total_consumption,
+                        adjusted_value=actual_difference,
+                        timestamp=group["timestamp"].iloc[-1]
+                    )
+                    all_anomalies.append(anomaly)
+                    
+                    # Adjust the total consumption
+                    log.warning(f"Device {device} - Adjusted total from {total_consumption:.2f} to {actual_difference:.2f} kWh")
+                    total_consumption = actual_difference
+                    
+                    # Update the result with the adjusted consumption
+                    results[-1]["consumption"] = actual_difference
+                    results[-1]["hourly_rate"] = actual_difference / max(total_duration, 1)
         else:
             if not gap_indices.empty:
                 # Handle segments with gaps but no resets
@@ -279,6 +309,29 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
                 })
                 
                 all_anomalies.extend(device_anomalies)
+                
+                # Enforce constraint if configured
+                if CONFIG["energy_analysis"].get("enforce_total_constraint", True):
+                    tolerance = CONFIG["energy_analysis"].get("constraint_tolerance", 0.05)
+                    max_allowed = actual_difference * (1 + tolerance)
+                    
+                    if total_consumption > max_allowed:
+                        anomaly = log_anomaly(
+                            device_id=device,
+                            anomaly_type="total_constraint",
+                            original_value=total_consumption,
+                            adjusted_value=actual_difference,
+                            timestamp=group["timestamp"].iloc[-1]
+                        )
+                        all_anomalies.append(anomaly)
+                        
+                        # Adjust the total consumption
+                        log.warning(f"Device {device} - Adjusted total from {total_consumption:.2f} to {actual_difference:.2f} kWh")
+                        total_consumption = actual_difference
+                        
+                        # Update the result with the adjusted consumption
+                        results[-1]["consumption"] = actual_difference
+                        results[-1]["hourly_rate"] = actual_difference / max(total_duration, 1)
             else:
                 # Normal case - no resets or significant gaps
                 consumption, duration, device_anomalies = calculate_time_weighted_consumption(
@@ -301,6 +354,29 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
                 })
                 
                 all_anomalies.extend(device_anomalies)
+                
+                # Enforce constraint if configured
+                if CONFIG["energy_analysis"].get("enforce_total_constraint", True):
+                    tolerance = CONFIG["energy_analysis"].get("constraint_tolerance", 0.05)
+                    max_allowed = actual_difference * (1 + tolerance)
+                    
+                    if consumption > max_allowed:
+                        anomaly = log_anomaly(
+                            device_id=device,
+                            anomaly_type="total_constraint",
+                            original_value=consumption,
+                            adjusted_value=actual_difference,
+                            timestamp=group["timestamp"].iloc[-1]
+                        )
+                        all_anomalies.append(anomaly)
+                        
+                        # Adjust the consumption
+                        log.warning(f"Device {device} - Adjusted total from {consumption:.2f} to {actual_difference:.2f} kWh")
+                        consumption = actual_difference
+                        
+                        # Update the result with the adjusted consumption
+                        results[-1]["consumption"] = actual_difference
+                        results[-1]["hourly_rate"] = actual_difference / max(duration, 1)
     
     result_df = pd.DataFrame(results)
     
@@ -1139,6 +1215,56 @@ def daily_device(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict]]:
     
     # Combine all anomalies
     all_anomalies.extend(daily_anomalies)
+    
+    if CONFIG["energy_analysis"].get("enforce_total_constraint", True):
+        # Group by device and calculate sum of daily consumption
+        device_totals = dd.groupby("device_id")["consumption"].sum().reset_index()
+        
+        try:
+            device_usage_path = os.path.join(CONFIG.get("output", {}).get("csv_dir", "csv_output"), "device_usage.csv")
+            if os.path.exists(device_usage_path):
+                device_usage = pd.read_csv(device_usage_path)
+                
+                device_totals = device_totals.merge(
+                    device_usage[["device_id", "consumption", "first_energy", "last_energy"]], 
+                    on="device_id", 
+                    how="left",
+                    suffixes=("_daily_sum", "_actual")
+                )
+                
+                for _, row in device_totals.iterrows():
+                    device_id = row["device_id"]
+                    daily_sum = row["consumption_daily_sum"]
+                    actual_total = row["consumption_actual"]
+                    actual_diff = row["last_energy"] - row["first_energy"]
+                    
+                    target_total = min(actual_total, max(0, actual_diff))
+                    
+                    if daily_sum > 0 and abs(daily_sum - target_total) > 0.1:  # If discrepancy > 0.1 kWh
+                        device_mask = dd["device_id"] == device_id
+                        
+                        if target_total > 0:
+                            scale_factor = target_total / daily_sum
+                            
+                            original_values = dd.loc[device_mask, "consumption"].copy()
+                            dd.loc[device_mask, "consumption"] = dd.loc[device_mask, "consumption"] * scale_factor
+                            
+                            # Log adjustment
+                            log.warning(f"Device {device_id} - Adjusted daily consumption sum from {daily_sum:.2f} to {target_total:.2f} kWh")
+                            
+                            for idx, orig_val in zip(dd[device_mask].index, original_values):
+                                adjusted_val = orig_val * scale_factor
+                                if abs(orig_val - adjusted_val) > 0.01:  # Only log significant adjustments
+                                    anomaly = log_anomaly(
+                                        device_id=device_id,
+                                        anomaly_type="daily_constraint",
+                                        original_value=orig_val,
+                                        adjusted_value=adjusted_val,
+                                        timestamp=pd.Timestamp(dd.loc[idx, "date"])
+                                    )
+                                    all_anomalies.append(anomaly)
+        except Exception as e:
+            log.error(f"Error adjusting daily consumption: {e}")
 
     return dd.round(2), all_anomalies
 

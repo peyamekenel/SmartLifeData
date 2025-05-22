@@ -55,7 +55,9 @@ DEFAULT_CONFIG = {
         "hourly_aggregation": "mean", # sum, mean
         "filter_negative_consumption": True,
         "min_valid_readings": 5,      # minimum number of readings for a device to be included
-        "gap_threshold_hours": 24     # threshold (in hours) for identifying significant gaps in data transmission
+        "gap_threshold_hours": 24,    # threshold (in hours) for identifying significant gaps in data transmission
+        "enforce_total_constraint": True,  # ensure calculated total doesn't exceed actual difference
+        "constraint_tolerance": 0.05   # tolerance factor for total constraint (e.g., 0.05 = 5% above actual)
     },
     "anomaly_detection": {
         "jump_threshold_factor": 2.0,  # factor above expected consumption to identify abnormal jumps
@@ -112,4 +114,4 @@ def _deep_update(source: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, An
             _deep_update(source[key], value)
         else:
             source[key] = value
-    return source    
+    return source      
