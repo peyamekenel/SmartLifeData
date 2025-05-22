@@ -56,8 +56,16 @@ DEFAULT_CONFIG = {
         "filter_negative_consumption": True,
         "min_valid_readings": 5,      # minimum number of readings for a device to be included
         "gap_threshold_hours": 24,    # threshold in hours to consider a gap large enough for redistribution
+        "micro_gap_threshold_hours": 12,  # threshold for detecting shorter multi-day gaps
         "use_time_weighted_distribution": False,  # whether to use time-weighted distribution
-        "log_redistributed_intervals": True       # whether to log redistributed intervals
+        "log_redistributed_intervals": True,      # whether to log redistributed intervals
+        "daily_max_percentile": 0.95,  # percentile cap for daily consumption values
+        "constraint_tolerance": 0.05,  # tolerance for net-delta cross-check (fraction of total)
+        "enable_diagnostic_export": True,  # whether to export diagnostic CSV
+        "special_audit_period": {      # period to specifically audit for delta bleeding
+            "start": "2025-03-13",
+            "end": "2025-03-18"
+        }
     }
 }
 
@@ -108,4 +116,4 @@ def _deep_update(source: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, An
             _deep_update(source[key], value)
         else:
             source[key] = value
-    return source  
+    return source    

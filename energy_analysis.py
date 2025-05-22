@@ -710,11 +710,15 @@ def daily_device(df: pd.DataFrame) -> pd.DataFrame:
     df["date"] = df["timestamp"].dt.date
     
     gap_threshold = pd.Timedelta(hours=CONFIG["energy_analysis"].get("gap_threshold_hours", 24))
+    micro_gap_threshold = pd.Timedelta(hours=CONFIG["energy_analysis"].get("micro_gap_threshold_hours", 12))
     use_weighted = CONFIG["energy_analysis"].get("use_time_weighted_distribution", False)
     log_redistributed = CONFIG["energy_analysis"].get("log_redistributed_intervals", True)
+    daily_max_percentile = CONFIG["energy_analysis"].get("daily_max_percentile", 0.95)
+    constraint_tolerance = CONFIG["energy_analysis"].get("constraint_tolerance", 0.05)
     
     # Process each device separately to handle transmission gaps
     devices_processed = []
+    flagged_devices = []
     
     for device_id, device_df in df.groupby("device_id"):
         # Sort by timestamp
@@ -725,8 +729,10 @@ def daily_device(df: pd.DataFrame) -> pd.DataFrame:
         device_df = device_df.reset_index(drop=True)
         time_diffs = device_df["timestamp"].diff()
         
-        # Identify large gaps (exceeding threshold)
-        gap_indices = time_diffs[time_diffs > gap_threshold].index.tolist()
+        # Identify gaps (both micro and large)
+        large_gap_indices = time_diffs[time_diffs > gap_threshold].index.tolist()
+        micro_gap_indices = time_diffs[(time_diffs > micro_gap_threshold) & (time_diffs <= gap_threshold)].index.tolist()
+        gap_indices = sorted(large_gap_indices + micro_gap_indices)
         
         if not gap_indices:
             device_daily = (
@@ -741,9 +747,31 @@ def daily_device(df: pd.DataFrame) -> pd.DataFrame:
             devices_processed.append(device_daily)
             continue
             
+        # Calculate historical percentiles for this device if we have enough data
+        historical_device_data = []
+        for segment_idx in range(len(gap_indices) + 1):
+            start_idx = 0 if segment_idx == 0 else gap_indices[segment_idx - 1]
+            end_idx = len(device_df) if segment_idx == len(gap_indices) else gap_indices[segment_idx]
+            segment = device_df.loc[start_idx:end_idx-1]
+            
+            if len(segment) > 1:
+                segment_daily = segment.groupby(["date"]).agg(
+                    first=("energy", "first"), 
+                    last=("energy", "last")
+                ).reset_index()
+                segment_daily["consumption"] = (segment_daily["last"] - segment_daily["first"]).clip(lower=0)
+                historical_device_data.append(segment_daily["consumption"])
+        
+        # Calculate device-specific percentile if we have enough data
+        if historical_device_data and pd.concat(historical_device_data).count() >= 5:
+            device_max = pd.concat(historical_device_data).quantile(daily_max_percentile)
+        else:
+            device_max = None  # Will be calculated after all devices are processed
+            
         # Process each segment (between gaps)
         segments = []
         start_idx = 0
+        total_expected_consumption = 0
         
         for gap_idx in gap_indices + [len(device_df)]:
             segment = device_df.loc[start_idx:gap_idx-1]
@@ -755,6 +783,7 @@ def daily_device(df: pd.DataFrame) -> pd.DataFrame:
                 
                 # Calculate consumption over the gap
                 gap_consumption = device_df.loc[start_idx, "energy"] - device_df.loc[start_idx-1, "energy"]
+                total_expected_consumption += gap_consumption
                 
                 if gap_consumption > 0:
                     # Create a date range for the gap period
@@ -764,28 +793,72 @@ def daily_device(df: pd.DataFrame) -> pd.DataFrame:
                         freq="D"
                     )
                     
+                    special_audit = CONFIG["energy_analysis"].get("special_audit_period", {})
+                    special_start = special_audit.get("start")
+                    special_end = special_audit.get("end")
+                    
+                    if special_start and special_end:
+                        special_start_date = pd.Timestamp(special_start).date()
+                        special_end_date = pd.Timestamp(special_end).date()
+                        
+                        # Check if gap overlaps with special audit period
+                        is_special_period = (
+                            (gap_start_ts.date() <= special_end_date and gap_end_ts.date() >= special_start_date)
+                        )
+                        
+                        if is_special_period:
+                            log.info(f"Special audit: gap for device {device_id} ({gap_start_ts.date()} to {gap_end_ts.date()})")
+                            
+                            if gap_end_ts.date() > special_end_date:
+                                gap_dates = gap_dates[gap_dates.date <= special_end_date]
+                                log.info(f"Restricting redistribution to special period end: {special_end_date}")
+                                
+                            if gap_start_ts.date() < special_start_date:
+                                gap_dates = gap_dates[gap_dates.date >= special_start_date]
+                                log.info(f"Restricting redistribution to special period start: {special_start_date}")
+                    
                     if len(gap_dates) > 0:
-                        if use_weighted:
-                            daily_consumption = gap_consumption / len(gap_dates)
+                        daily_consumption = gap_consumption / len(gap_dates)
+                        
+                        # Apply percentile cap if available
+                        if device_max is not None:
+                            # Create distribution dataframe
                             distributed = pd.DataFrame({
                                 "date": gap_dates.date,
                                 "device_id": device_id,
                                 "device_class": device_class,
                                 "consumption": daily_consumption,
                                 "is_redistributed": True,
+                                "was_gap": True,
                                 "first": float('nan'),
-                                "last": float('nan')
+                                "last": float('nan'),
+                                "hist_max": device_max
                             })
+                            
+                            # Identify days exceeding cap
+                            over_cap = distributed[distributed["consumption"] > device_max]
+                            if not over_cap.empty:
+                                # Calculate excess to redistribute
+                                total_excess = (over_cap["consumption"] - device_max).sum()
+                                remaining_days = len(distributed) - len(over_cap)
+                                
+                                if remaining_days > 0:
+                                    additional_per_day = total_excess / remaining_days
+                                    distributed.loc[distributed["consumption"] <= device_max, "consumption"] += additional_per_day
+                                    distributed.loc[distributed["consumption"] > device_max, "consumption"] = device_max
+                                else:
+                                    distributed["consumption"] = device_max
                         else:
-                            daily_consumption = gap_consumption / len(gap_dates)
                             distributed = pd.DataFrame({
                                 "date": gap_dates.date,
                                 "device_id": device_id,
                                 "device_class": device_class,
                                 "consumption": daily_consumption,
                                 "is_redistributed": True,
+                                "was_gap": True,
                                 "first": float('nan'),
-                                "last": float('nan')
+                                "last": float('nan'),
+                                "hist_max": float('nan')
                             })
                         
                         segments.append(distributed)
@@ -807,12 +880,37 @@ def daily_device(df: pd.DataFrame) -> pd.DataFrame:
                 segment_daily["device_class"] = device_class
                 segment_daily["consumption"] = (segment_daily["last"] - segment_daily["first"]).clip(lower=0)
                 segment_daily["is_redistributed"] = False
+                segment_daily["was_gap"] = False
+                
+                # Calculate expected consumption for this segment
+                total_expected_consumption += segment_daily["consumption"].sum()
+                
+                if device_max is not None:
+                    segment_daily["hist_max"] = device_max
+                else:
+                    segment_daily["hist_max"] = float('nan')
+                
                 segments.append(segment_daily)
                 
             start_idx = gap_idx
         
         if segments:
             device_result = pd.concat(segments, ignore_index=True)
+            
+            total_actual_consumption = device_result["consumption"].sum()
+            delta_from_expected = abs(total_actual_consumption - total_expected_consumption)
+            
+            if delta_from_expected > (constraint_tolerance * total_expected_consumption):
+                log.warning(
+                    f"Net-delta cross-check failed for device {device_id}: "
+                    f"expected={total_expected_consumption:.2f}, actual={total_actual_consumption:.2f}, "
+                    f"delta={delta_from_expected:.2f}"
+                )
+                device_result["delta_from_expected"] = total_expected_consumption - total_actual_consumption
+                flagged_devices.append(device_id)
+            else:
+                device_result["delta_from_expected"] = 0
+                
             devices_processed.append(device_result)
     
     if not devices_processed:
@@ -1248,6 +1346,23 @@ def main(path: str | Path = "db16_db18_smartlife_feb15_apr15.json",
         if not daily_dev.empty:
             save_columns = [col for col in daily_dev.columns if col != 'is_redistributed']
             daily_dev[save_columns].to_csv(csv_dir / "daily_device_consumption.csv", index=False)
+            
+            enable_diagnostic = CONFIG["energy_analysis"].get("enable_diagnostic_export", False)
+            if enable_diagnostic:
+                diagnostic_columns = [
+                    "device_id", "date", "was_gap", "is_redistributed", 
+                    "consumption", "hist_max", "delta_from_expected"
+                ]
+                diagnostic_cols = [col for col in diagnostic_columns if col in daily_dev.columns]
+                daily_dev[diagnostic_cols].to_csv(csv_dir / "energy_diagnostic.csv", index=False)
+                log.info(f"Exported diagnostic data to {csv_dir / 'energy_diagnostic.csv'}")
+                
+                flagged_devices = daily_dev[daily_dev["delta_from_expected"] != 0]["device_id"].unique()
+                if len(flagged_devices) > 0:
+                    log.warning(f"Found {len(flagged_devices)} devices with delta cross-check issues")
+                    for device in flagged_devices:
+                        log.warning(f"  - Device {device} flagged for review")
+                        
         if not monthly_dev.empty:
             monthly_dev.to_csv(csv_dir / "monthly_device_consumption.csv", index=False)
         if not weekday_dev.empty:
@@ -1516,7 +1631,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Energy consumption analysis")
-    parser.add_argument("--input", "-i", default="db16_db18_db14_smartlife_feb15_may20.json",
+    parser.add_argument("--input", "-i", default="db16_db18_smartlife_feb15_apr15.json",
                       help="Input JSON file path")
     parser.add_argument("--no-cache", action="store_true", 
                       help="Disable data caching")
