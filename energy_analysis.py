@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union, Tuple
@@ -152,15 +153,22 @@ def load_data(file_path: str | Path) -> Tuple[pd.DataFrame, DataQualityMetrics]:
 # ────────────────────────────────────────────────────────────────────────────────
 
 
-def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics]:
+def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics, List[Dict]]:
     """
     Calculate energy consumption per device with data quality metrics.
     
     Uses a time-weighted approach to handle varying data transmission frequencies,
-    gaps in data, and meter resets.
+    gaps in data, and meter resets. Detects and logs anomalies such as large jumps
+    across gaps and outlier consumption rates.
+    
+    Args:
+        df: DataFrame with device energy readings
+        
+    Returns:
+        Tuple of (device_consumption_df, quality_metrics, anomalies)
     """
     if df.empty:
-        return pd.DataFrame(), DataQualityMetrics()
+        return pd.DataFrame(), DataQualityMetrics(), []
     
     df = df.sort_values(["device_id", "timestamp"])
     
@@ -168,6 +176,9 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
     results = []
     devices_with_resets = []
     devices_with_gaps = []
+    all_anomalies = []  # Track all anomalies across devices
+    
+    gap_threshold = CONFIG.get("energy_analysis", {}).get("gap_threshold_hours", 24)
     
     for device, group in df.groupby("device_id"):
         if len(group) < CONFIG["energy_analysis"]["min_valid_readings"]:
@@ -178,11 +189,12 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
         group["energy_diff"] = group["energy"].diff()
         group["time_diff"] = group["timestamp"].diff().dt.total_seconds() / 3600  # in hours
         
+        device_anomalies = []
+        
         # Identify large negative jumps (potential resets)
         reset_indices = group[group["energy_diff"] < -10].index
         
         # Identify significant gaps in data transmission
-        gap_threshold = CONFIG.get("energy_analysis", {}).get("gap_threshold_hours", 24)
         gap_indices = group[group["time_diff"] > gap_threshold].index
         
         if not gap_indices.empty:
@@ -202,11 +214,14 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
                     segment_df = group.loc[segment]
                     
                     # Calculate time-weighted consumption for this segment
-                    segment_consumption, segment_duration = calculate_time_weighted_consumption(segment_df)
+                    segment_consumption, segment_duration, segment_anomalies = calculate_time_weighted_consumption(
+                        segment_df, max_gap_hours=gap_threshold, device_id=device
+                    )
                     
                     if segment_consumption >= 0:
                         total_consumption += segment_consumption
                         total_duration += segment_duration
+                        device_anomalies.extend(segment_anomalies)
             
             # Calculate average hourly rate and extrapolate if needed
             hourly_rate = total_consumption / max(total_duration, 1)  # Avoid division by zero
@@ -221,8 +236,11 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
                 "duration_hours": total_duration,
                 "has_resets": True,
                 "has_gaps": len(set(gap_indices)) > 0,
-                "num_readings": len(group)
+                "num_readings": len(group),
+                "anomalies_detected": len(device_anomalies) > 0
             })
+            
+            all_anomalies.extend(device_anomalies)
         else:
             if not gap_indices.empty:
                 # Handle segments with gaps but no resets
@@ -235,11 +253,14 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
                 for segment in segments:
                     if len(segment) >= 2:
                         segment_df = group.loc[segment]
-                        segment_consumption, segment_duration = calculate_time_weighted_consumption(segment_df)
+                        segment_consumption, segment_duration, segment_anomalies = calculate_time_weighted_consumption(
+                            segment_df, max_gap_hours=gap_threshold, device_id=device
+                        )
                         
                         if segment_consumption >= 0:
                             total_consumption += segment_consumption
                             total_duration += segment_duration
+                            device_anomalies.extend(segment_anomalies)
                 
                 hourly_rate = total_consumption / max(total_duration, 1)
                 
@@ -253,11 +274,16 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
                     "duration_hours": total_duration,
                     "has_resets": False,
                     "has_gaps": True,
-                    "num_readings": len(group)
+                    "num_readings": len(group),
+                    "anomalies_detected": len(device_anomalies) > 0
                 })
+                
+                all_anomalies.extend(device_anomalies)
             else:
                 # Normal case - no resets or significant gaps
-                consumption, duration = calculate_time_weighted_consumption(group)
+                consumption, duration, device_anomalies = calculate_time_weighted_consumption(
+                    group, max_gap_hours=gap_threshold, device_id=device
+                )
                 hourly_rate = consumption / max(duration, 1)
                 
                 results.append({
@@ -270,8 +296,11 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
                     "duration_hours": duration,
                     "has_resets": False,
                     "has_gaps": False,
-                    "num_readings": len(group)
+                    "num_readings": len(group),
+                    "anomalies_detected": len(device_anomalies) > 0
                 })
+                
+                all_anomalies.extend(device_anomalies)
     
     result_df = pd.DataFrame(results)
     
@@ -282,6 +311,7 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
         valid = result_df.copy()
     
     log.info("Devices kept: %d • Excluded: %d", len(valid), len(result_df) - len(valid))
+    log.info("Anomalies detected: %d", len(all_anomalies))
     
     # Calculate data quality metrics
     quality_metrics = validate_consumption_data(result_df)
@@ -292,21 +322,70 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
     if devices_with_gaps:
         log.warning("Detected significant gaps in data for %d devices", len(devices_with_gaps))
         
-    return valid.round({"consumption": 2, "hourly_rate": 4}), quality_metrics
+    return valid.round({"consumption": 2, "hourly_rate": 4}), quality_metrics, all_anomalies
 
 
-def calculate_time_weighted_consumption(df: pd.DataFrame) -> Tuple[float, float]:
+def log_anomaly(device_id: str, anomaly_type: str, original_value: float, adjusted_value: float, 
+                timestamp: Optional[pd.Timestamp] = None, duration_hours: Optional[float] = None) -> Dict:
     """
-    Calculate time-weighted consumption for a device dataframe.
+    Log details about detected anomalies for auditing and monitoring.
+    
+    Args:
+        device_id: ID of the device with the anomaly
+        anomaly_type: Type of anomaly (e.g., 'gap_jump', 'outlier')
+        original_value: Original value before adjustment
+        adjusted_value: Value after adjustment/normalization
+        timestamp: Optional timestamp when the anomaly occurred
+        duration_hours: Optional duration of the gap in hours
+        
+    Returns:
+        Dictionary with anomaly details
+    """
+    anomaly = {
+        "device_id": device_id,
+        "anomaly_type": anomaly_type,
+        "original_value": original_value,
+        "adjusted_value": adjusted_value,
+        "adjustment_ratio": adjusted_value / max(original_value, 0.001),
+        "timestamp": timestamp,
+        "duration_hours": duration_hours,
+        "detection_time": pd.Timestamp.now()
+    }
+    
+    log.warning(
+        "Anomaly detected: %s for device %s - Original: %.2f, Adjusted: %.2f",
+        anomaly_type, device_id, original_value, adjusted_value
+    )
+    
+    return anomaly
+
+
+def calculate_time_weighted_consumption(df: pd.DataFrame, max_gap_hours: Optional[float] = None,
+                                        device_id: Optional[str] = None) -> Tuple[float, float, List[Dict]]:
+    """
+    Calculate time-weighted energy consumption for a device's data.
+    
+    Handles varying data transmission frequencies, gaps, and anomalies.
     
     Args:
         df: DataFrame with timestamp, energy, energy_diff, and time_diff columns
-        
+        max_gap_hours: Maximum allowed gap in hours before applying special handling
+        device_id: Optional device ID for anomaly logging
+            
     Returns:
-        Tuple of (consumption, duration_hours)
+        Tuple of (total_consumption, duration_hours, anomalies)
     """
-    if len(df) < 2:
-        return 0.0, 0.0
+    if df.empty or len(df) < 2:
+        return 0.0, 0.0, []
+        
+    if max_gap_hours is None:
+        max_gap_hours = CONFIG.get("energy_analysis", {}).get("gap_threshold_hours", 24)
+    
+    anomaly_config = CONFIG.get("anomaly_detection", {})
+    jump_threshold = anomaly_config.get("jump_threshold_factor", 2.0)
+    use_time_weighted = anomaly_config.get("use_time_weighted_distribution", False)
+    log_anomalies = anomaly_config.get("log_anomalies", True)
+    iqr_multiplier = anomaly_config.get("iqr_multiplier", 1.5)
     
     # Calculate point-to-point consumption and time differences
     if "energy_diff" not in df.columns:
@@ -317,26 +396,123 @@ def calculate_time_weighted_consumption(df: pd.DataFrame) -> Tuple[float, float]
         df = df.copy()
         df["time_diff"] = df["timestamp"].diff().dt.total_seconds() / 3600  # in hours
     
-    # Filter out negative energy differences (except for resets which are handled separately)
-    df_valid = df[(df["energy_diff"] >= 0) & (df["time_diff"] > 0)].copy()
+    df_valid = df.copy()
+    df_valid = df_valid.dropna(subset=["energy_diff", "time_diff"])
+    
+    # Filter out negative energy differences (likely meter resets)
+    df_valid = df_valid[(df_valid["energy_diff"] >= 0) & (df_valid["time_diff"] > 0)]
+    
+    anomalies = []
     
     if df_valid.empty:
-        total_duration = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds() / 3600
-        consumption = max(0, df["energy"].iloc[-1] - df["energy"].iloc[0])
-        return consumption, total_duration
+        if len(df) >= 2:
+            duration = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds() / 3600
+            return 0.0, duration, []
+        return 0.0, 0.0, []
     
-    # Calculate consumption rate for each interval (kWh/hour)
+    # Check for large gaps that might indicate cumulative jumps
+    large_gaps = df_valid[df_valid["time_diff"] > max_gap_hours].copy()
+    
+    if not large_gaps.empty:
+        print(f"DEBUG: Found {len(large_gaps)} large gaps")
+        # Handle large gaps separately to normalize consumption
+        regular_data = df_valid[df_valid["time_diff"] <= max_gap_hours].copy()
+        
+        # Calculate rate for regular intervals (kWh/hour)
+        if not regular_data.empty:
+            regular_data["rate"] = regular_data["energy_diff"] / regular_data["time_diff"]
+            median_rate = regular_data["rate"].median()
+            print(f"DEBUG: Median rate from regular data: {median_rate:.6f} kWh/hour")
+            
+            if use_time_weighted:
+                # Group by hour of day to get typical consumption patterns
+                regular_data["hour"] = regular_data["timestamp"].dt.hour
+                hourly_rates = regular_data.groupby("hour")["rate"].median()
+                
+                if len(hourly_rates) >= 12:  # At least half the day covered
+                    for hour in range(24):
+                        if hour not in hourly_rates:
+                            hourly_rates[hour] = median_rate
+                else:
+                    hourly_rates = pd.Series([median_rate] * 24, index=range(24))
+            else:
+                median_rate = regular_data["rate"].median()
+        else:
+            median_rate = 0.05  # Default to low consumption rate (kWh/hour)
+            print(f"DEBUG: Using default rate: {median_rate:.6f} kWh/hour")
+            if use_time_weighted:
+                hourly_rates = pd.Series([median_rate] * 24, index=range(24))
+        
+        for idx, row in large_gaps.iterrows():
+            gap_hours = row["time_diff"]
+            start_time = row["timestamp"] - pd.Timedelta(hours=gap_hours)
+            
+            print(f"DEBUG: Gap of {gap_hours:.1f} hours detected")
+            print(f"DEBUG: Energy diff across gap: {row['energy_diff']:.2f} kWh")
+            
+            if use_time_weighted:
+                # Calculate expected consumption using hourly patterns
+                expected = 0
+                current_hour = start_time
+                while current_hour < row["timestamp"]:
+                    hour_idx = current_hour.hour
+                    fraction = min(1.0, (row["timestamp"] - current_hour).total_seconds() / 3600)
+                    expected += hourly_rates[hour_idx] * fraction
+                    current_hour += pd.Timedelta(hours=1)
+            else:
+                expected = median_rate * gap_hours
+            
+            print(f"DEBUG: Expected consumption for gap: {expected:.2f} kWh")
+            print(f"DEBUG: Jump threshold: {jump_threshold}")
+            print(f"DEBUG: Threshold value: {expected * jump_threshold:.2f} kWh")
+            
+            if row["energy_diff"] >= expected * jump_threshold:
+                original_value = row["energy_diff"]
+                large_gaps.at[idx, "energy_diff"] = expected
+                print(f"DEBUG: Normalized gap consumption from {original_value:.2f} to {expected:.2f} kWh")
+                
+                if log_anomalies and device_id:
+                    anomaly = log_anomaly(
+                        device_id=device_id,
+                        anomaly_type="gap_jump",
+                        original_value=original_value,
+                        adjusted_value=expected,
+                        timestamp=row["timestamp"],
+                        duration_hours=gap_hours
+                    )
+                    anomalies.append(anomaly)
+            else:
+                print(f"DEBUG: Gap consumption {row['energy_diff']:.2f} kWh is below threshold, not normalizing")
+        
+        df_valid = pd.concat([regular_data, large_gaps])
+    
+    # Calculate consumption rates (kWh/hour)
     df_valid["rate"] = df_valid["energy_diff"] / df_valid["time_diff"]
     
-    # Handle outliers in rates
+    # Handle outliers in consumption rates using IQR method
     q1, q3 = df_valid["rate"].quantile([0.25, 0.75])
     iqr = q3 - q1
-    upper_bound = q3 + 3 * iqr
+    upper_bound = q3 + iqr_multiplier * iqr
     
     # Cap extreme rates
-    if (df_valid["rate"] > upper_bound).any():
-        df_valid.loc[df_valid["rate"] > upper_bound, "rate"] = upper_bound
-        df_valid.loc[df_valid["rate"] > upper_bound, "energy_diff"] = df_valid["rate"] * df_valid["time_diff"]
+    extreme_rates = df_valid[df_valid["rate"] > upper_bound]
+    if not extreme_rates.empty:
+        for idx, row in extreme_rates.iterrows():
+            original_rate = row["rate"]
+            original_energy = row["energy_diff"]
+            
+            df_valid.loc[idx, "rate"] = upper_bound
+            df_valid.loc[idx, "energy_diff"] = upper_bound * row["time_diff"]
+            
+            if log_anomalies and device_id:
+                anomaly = log_anomaly(
+                    device_id=device_id,
+                    anomaly_type="rate_outlier",
+                    original_value=original_rate,
+                    adjusted_value=upper_bound,
+                    timestamp=row["timestamp"]
+                )
+                anomalies.append(anomaly)
     
     # Calculate total consumption and duration
     total_consumption = df_valid["energy_diff"].sum()
@@ -345,7 +521,7 @@ def calculate_time_weighted_consumption(df: pd.DataFrame) -> Tuple[float, float]
     if total_duration < 1:  # Less than 1 hour of valid data
         total_duration = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds() / 3600
     
-    return total_consumption, total_duration
+    return total_consumption, total_duration, anomalies
 
 
 def class_totals(dev_usage: pd.DataFrame) -> pd.DataFrame:
@@ -865,14 +1041,21 @@ def bar_monthly_usage(month_df: pd.DataFrame):
 # DEVICE-LEVEL ANALYSIS FUNCTIONS
 # ────────────────────────────────────────────────────────────────────────────────
 
-def daily_device(df: pd.DataFrame) -> pd.DataFrame:
+def daily_device(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict]]:
     """
     Calculate daily consumption for individual devices using time-weighted approach.
     
     Handles varying data transmission frequencies and gaps within each day.
+    Detects and logs anomalies using both device-specific and global thresholds.
+    
+    Args:
+        df: DataFrame with device energy readings
+        
+    Returns:
+        Tuple of (daily_consumption_df, anomalies)
     """
     if df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), []
         
     df = df.sort_values(["device_id", "timestamp"])
     # Extract date from timestamp while preserving timezone information
@@ -880,6 +1063,10 @@ def daily_device(df: pd.DataFrame) -> pd.DataFrame:
 
     # Calculate time-weighted consumption for each device-day
     daily_results = []
+    all_anomalies = []
+    
+    # Get gap threshold from config
+    gap_threshold = CONFIG.get("energy_analysis", {}).get("gap_threshold_hours", 24)
     
     for (device_id, date, device_class), group in df.groupby(["device_id", "date", "device_class"]):
         if len(group) < 2:
@@ -887,7 +1074,9 @@ def daily_device(df: pd.DataFrame) -> pd.DataFrame:
             continue
             
         # Calculate time-weighted consumption for this device-day
-        consumption, duration = calculate_time_weighted_consumption(group)
+        consumption, duration, anomalies = calculate_time_weighted_consumption(
+            group, max_gap_hours=gap_threshold, device_id=device_id
+        )
         
         daily_results.append({
             "device_id": device_id,
@@ -896,28 +1085,71 @@ def daily_device(df: pd.DataFrame) -> pd.DataFrame:
             "consumption": consumption,
             "duration_hours": duration
         })
+        
+        all_anomalies.extend(anomalies)
     
     dd = pd.DataFrame(daily_results)
     
     if dd.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), []
     
     # Handle potential anomalies (extremely high values)
-    # Identify extreme outliers (more than 3 IQRs above Q3)
+    anomaly_config = CONFIG.get("anomaly_detection", {})
+    iqr_multiplier = anomaly_config.get("iqr_multiplier", 1.5)
+    log_anomalies = anomaly_config.get("log_anomalies", True)
+    daily_anomalies = []
+    
+    # Calculate device-specific statistics
+    device_stats = dd.groupby("device_id")["consumption"].agg(["median", "std"]).reset_index()
+    device_stats["upper_bound"] = device_stats["median"] + 3 * device_stats["std"]
+    
     q1, q3 = dd["consumption"].quantile([0.25, 0.75])
     iqr = q3 - q1
-    upper_bound = q3 + 3 * iqr
+    global_upper_bound = q3 + iqr_multiplier * iqr
     
-    # Cap extreme values
-    if (dd["consumption"] > upper_bound).any():
-        log.warning("Capping %d extreme daily consumption values", (dd["consumption"] > upper_bound).sum())
-        dd["consumption"] = dd["consumption"].clip(upper=upper_bound)
+    # Merge device-specific bounds back to the dataframe
+    dd = dd.merge(device_stats[["device_id", "upper_bound"]], on="device_id", how="left")
+    
+    dd["effective_bound"] = dd[["upper_bound"]].min(axis=1)
+    dd["global_bound"] = global_upper_bound
+    dd["final_bound"] = dd[["effective_bound", "global_bound"]].min(axis=1)
+    
+    # Cap extreme values and log
+    extreme_mask = dd["consumption"] > dd["final_bound"]
+    if extreme_mask.any():
+        for idx, row in dd[extreme_mask].iterrows():
+            original_value = row["consumption"]
+            adjusted_value = row["final_bound"]
+            
+            dd.at[idx, "consumption"] = adjusted_value
+            
+            if log_anomalies:
+                anomaly = log_anomaly(
+                    device_id=row["device_id"],
+                    anomaly_type="daily_outlier",
+                    original_value=original_value,
+                    adjusted_value=adjusted_value,
+                    timestamp=pd.Timestamp(row["date"])
+                )
+                daily_anomalies.append(anomaly)
+        
+        log.warning("Capped %d extreme daily consumption values", extreme_mask.sum())
+    
+    dd = dd.drop(columns=["upper_bound", "effective_bound", "global_bound", "final_bound"])
+    
+    # Combine all anomalies
+    all_anomalies.extend(daily_anomalies)
 
-    return dd.round(2)
+    return dd.round(2), all_anomalies
 
 
-def monthly_device(daily_dev: pd.DataFrame) -> pd.DataFrame:
+def monthly_device(daily_dev_data) -> pd.DataFrame:
     """Calculate monthly consumption for individual devices."""
+    if isinstance(daily_dev_data, tuple):
+        daily_dev, _ = daily_dev_data  # Unpack tuple, ignore anomalies
+    else:
+        daily_dev = daily_dev_data
+        
     if daily_dev.empty:
         return pd.DataFrame()
         
@@ -935,8 +1167,13 @@ def monthly_device(daily_dev: pd.DataFrame) -> pd.DataFrame:
     return m.round(2).drop(columns="month_start")
 
 
-def weekday_device(daily_dev: pd.DataFrame) -> pd.DataFrame:
+def weekday_device(daily_dev_data) -> pd.DataFrame:
     """Calculate average consumption by weekday for individual devices."""
+    if isinstance(daily_dev_data, tuple):
+        daily_dev, _ = daily_dev_data  # Unpack tuple, ignore anomalies
+    else:
+        daily_dev = daily_dev_data
+        
     if daily_dev.empty:
         return pd.DataFrame()
         
@@ -974,7 +1211,7 @@ def hourly_device_average(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
     for device, group in df.groupby("device_id"):
         if len(group) < 2:
             continue
-        consumption, _ = calculate_time_weighted_consumption(group)
+        consumption, _, _ = calculate_time_weighted_consumption(group)
         device_results.append({"device_id": device, "consumption": consumption})
     
     device_totals = pd.DataFrame(device_results)
@@ -1005,7 +1242,7 @@ def hourly_device_average(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
             continue
             
         # Calculate time-weighted consumption for this hour
-        consumption, duration = calculate_time_weighted_consumption(group)
+        consumption, duration, _ = calculate_time_weighted_consumption(group)
         
         if duration > 0.15:  # 0.15 hours = ~10 minutes
             hourly_results.append({
@@ -1205,7 +1442,7 @@ def plot_hourly_device(hourly_dev: pd.DataFrame):
     
     if len(devices) > 8:
         log.info(f"Limiting hourly device plots to top 8 devices (out of {len(devices)})")
-        devices = hourly_dev.groupby("device_id")["delta"].sum().sort_values(ascending=False).head(8).index.tolist()
+        devices = hourly_dev.groupby("device_id")["consumption"].sum().sort_values(ascending=False).head(8).index.tolist()
     
     # Create two subplots side by side - weekday and weekend
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
@@ -1221,7 +1458,7 @@ def plot_hourly_device(hourly_dev: pd.DataFrame):
             device_class = device_classes[device]
             ax1.plot(
                 device_data["hour_of_day"], 
-                device_data["delta"],
+                device_data["consumption"],
                 marker='o', 
                 linewidth=2,
                 label=f"{device} ({device_class})"
@@ -1242,7 +1479,7 @@ def plot_hourly_device(hourly_dev: pd.DataFrame):
             device_class = device_classes[device]
             ax2.plot(
                 device_data["hour_of_day"], 
-                device_data["delta"],
+                device_data["consumption"],
                 marker='s', 
                 linewidth=2,
                 label=f"{device} ({device_class})"
@@ -1333,11 +1570,15 @@ def main(path: str | Path = "db16_db18_smartlife_feb15_apr15.json",
     quality_metrics.print_summary()
 
     # Process energy consumption data
-    dev_usage, usage_metrics = per_device_usage(df)
+    dev_usage, usage_metrics, all_anomalies = per_device_usage(df)
     
     if dev_usage.empty:
         log.warning("No valid device usage data found")
         return
+        
+    if output_csv and all_anomalies:
+        anomaly_csv_path = Path("csv_output/energy_consumption_anomalies.csv")
+        save_anomalies_to_csv(all_anomalies, anomaly_csv_path)
     
     # Save processed data to CSV if requested
     if output_csv:
@@ -1350,15 +1591,21 @@ def main(path: str | Path = "db16_db18_smartlife_feb15_apr15.json",
     daily = daily_class(df)
     
     # Calculate device-level statistics
-    daily_dev = daily_device(df)
-    monthly_dev = monthly_device(daily_dev)
-    weekday_dev = weekday_device(daily_dev)
+    daily_dev_result = daily_device(df)
+    daily_dev_df, daily_anomalies = daily_dev_result  # Unpack tuple
+    
+    # Add daily anomalies to all_anomalies
+    if output_csv and daily_anomalies:
+        all_anomalies.extend(daily_anomalies)
+        
+    monthly_dev = monthly_device(daily_dev_df)
+    weekday_dev = weekday_device(daily_dev_df)
     hourly_dev = hourly_device_average(df)
     
     # Save device-level data to CSV if requested
     if output_csv:
-        if not daily_dev.empty:
-            daily_dev.to_csv(csv_dir / "daily_device_consumption.csv", index=False)
+        if not daily_dev_df.empty:
+            daily_dev_df.to_csv(csv_dir / "daily_device_consumption.csv", index=False)
         if not monthly_dev.empty:
             monthly_dev.to_csv(csv_dir / "monthly_device_consumption.csv", index=False)
         if not weekday_dev.empty:
@@ -1512,8 +1759,8 @@ def main(path: str | Path = "db16_db18_smartlife_feb15_apr15.json",
     if not dev_usage.empty:
         bar_device_total(dev_usage)
     
-    if not daily_dev.empty:
-        line_daily_device(daily_dev)
+    if not daily_dev_df.empty:
+        line_daily_device(daily_dev_df)
     
     if not weekday_dev.empty:
         plot_weekday_device(weekday_dev)
@@ -1622,6 +1869,35 @@ def main(path: str | Path = "db16_db18_smartlife_feb15_apr15.json",
     log.info("Done. Charts saved in %s", OUT_DIR.resolve())
     if output_csv:
         log.info("CSV files saved in %s", csv_dir.resolve())
+
+
+def save_anomalies_to_csv(anomalies: List[Dict], file_path: str) -> None:
+    """
+    Save detected anomalies to CSV file for auditing.
+    
+    Args:
+        anomalies: List of anomaly dictionaries
+        file_path: Path to save the CSV file
+    """
+    if not anomalies:
+        log.info("No anomalies detected to save")
+        return
+        
+    # Convert list of anomaly dictionaries to DataFrame
+    anomaly_df = pd.DataFrame(anomalies)
+    
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    
+    # Format timestamp columns for better readability
+    if "timestamp" in anomaly_df.columns:
+        anomaly_df["timestamp"] = anomaly_df["timestamp"].astype(str)
+    if "detection_time" in anomaly_df.columns:
+        anomaly_df["detection_time"] = anomaly_df["detection_time"].astype(str)
+    
+    # Save to CSV
+    anomaly_df.to_csv(file_path, index=False)
+    log.info("Saved %d anomaly records to %s", len(anomalies), file_path)
+
 
 if __name__ == "__main__":
     import argparse

@@ -56,6 +56,12 @@ DEFAULT_CONFIG = {
         "filter_negative_consumption": True,
         "min_valid_readings": 5,      # minimum number of readings for a device to be included
         "gap_threshold_hours": 24     # threshold (in hours) for identifying significant gaps in data transmission
+    },
+    "anomaly_detection": {
+        "jump_threshold_factor": 2.0,  # factor above expected consumption to identify abnormal jumps
+        "iqr_multiplier": 1.5,         # multiplier for IQR-based outlier detection
+        "use_time_weighted_distribution": False,  # whether to use time-weighted distribution across gaps
+        "log_anomalies": True          # whether to log details about detected anomalies
     }
 }
 
@@ -106,4 +112,4 @@ def _deep_update(source: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, An
             _deep_update(source[key], value)
         else:
             source[key] = value
-    return source  
+    return source    
