@@ -156,7 +156,8 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
     """
     Calculate energy consumption per device with data quality metrics.
     
-    Uses a more robust approach to handle resets and outliers.
+    Uses a time-weighted approach to handle varying data transmission frequencies,
+    gaps in data, and meter resets.
     """
     if df.empty:
         return pd.DataFrame(), DataQualityMetrics()
@@ -166,29 +167,49 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
     # Group by device and calculate consumption more robustly
     results = []
     devices_with_resets = []
+    devices_with_gaps = []
     
     for device, group in df.groupby("device_id"):
         if len(group) < CONFIG["energy_analysis"]["min_valid_readings"]:
             continue
             
         # Check for anomalies or meter resets
-        energy_diff = group["energy"].diff()
+        group = group.copy()  # Create a copy to avoid SettingWithCopyWarning
+        group["energy_diff"] = group["energy"].diff()
+        group["time_diff"] = group["timestamp"].diff().dt.total_seconds() / 3600  # in hours
         
         # Identify large negative jumps (potential resets)
-        reset_indices = energy_diff[energy_diff < -10].index
+        reset_indices = group[group["energy_diff"] < -10].index
         
+        # Identify significant gaps in data transmission
+        gap_threshold = CONFIG.get("energy_analysis", {}).get("gap_threshold_hours", 24)
+        gap_indices = group[group["time_diff"] > gap_threshold].index
+        
+        if not gap_indices.empty:
+            devices_with_gaps.append(device)
+            
         if not reset_indices.empty:
             # Handle resets by treating each segment separately
             devices_with_resets.append(device)
-            segments = np.split(group.index, reset_indices)
+            segment_indices = sorted(set(reset_indices) | set(gap_indices))
+            segments = np.split(group.index, [list(group.index).index(idx) for idx in segment_indices if idx in group.index])
             
             total_consumption = 0
+            total_duration = 0  # Total time in hours
+            
             for segment in segments:
                 if len(segment) >= 2:
                     segment_df = group.loc[segment]
-                    segment_consumption = segment_df["energy"].iloc[-1] - segment_df["energy"].iloc[0]
+                    
+                    # Calculate time-weighted consumption for this segment
+                    segment_consumption, segment_duration = calculate_time_weighted_consumption(segment_df)
+                    
                     if segment_consumption >= 0:
                         total_consumption += segment_consumption
+                        total_duration += segment_duration
+            
+            # Calculate average hourly rate and extrapolate if needed
+            hourly_rate = total_consumption / max(total_duration, 1)  # Avoid division by zero
             
             results.append({
                 "device_id": device,
@@ -196,21 +217,61 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
                 "first_energy": group["energy"].iloc[0],
                 "last_energy": group["energy"].iloc[-1],
                 "consumption": total_consumption,
+                "hourly_rate": hourly_rate,
+                "duration_hours": total_duration,
                 "has_resets": True,
+                "has_gaps": len(set(gap_indices)) > 0,
                 "num_readings": len(group)
             })
         else:
-            # Normal case - no resets
-            consumption = group["energy"].iloc[-1] - group["energy"].iloc[0]
-            results.append({
-                "device_id": device,
-                "device_class": group["device_class"].iloc[0],
-                "first_energy": group["energy"].iloc[0],
-                "last_energy": group["energy"].iloc[-1],
-                "consumption": max(0, consumption),  # Ensure non-negative
-                "has_resets": False,
-                "num_readings": len(group)
-            })
+            if not gap_indices.empty:
+                # Handle segments with gaps but no resets
+                segment_indices = sorted(gap_indices)
+                segments = np.split(group.index, [list(group.index).index(idx) for idx in segment_indices if idx in group.index])
+                
+                total_consumption = 0
+                total_duration = 0
+                
+                for segment in segments:
+                    if len(segment) >= 2:
+                        segment_df = group.loc[segment]
+                        segment_consumption, segment_duration = calculate_time_weighted_consumption(segment_df)
+                        
+                        if segment_consumption >= 0:
+                            total_consumption += segment_consumption
+                            total_duration += segment_duration
+                
+                hourly_rate = total_consumption / max(total_duration, 1)
+                
+                results.append({
+                    "device_id": device,
+                    "device_class": group["device_class"].iloc[0],
+                    "first_energy": group["energy"].iloc[0],
+                    "last_energy": group["energy"].iloc[-1],
+                    "consumption": total_consumption,
+                    "hourly_rate": hourly_rate,
+                    "duration_hours": total_duration,
+                    "has_resets": False,
+                    "has_gaps": True,
+                    "num_readings": len(group)
+                })
+            else:
+                # Normal case - no resets or significant gaps
+                consumption, duration = calculate_time_weighted_consumption(group)
+                hourly_rate = consumption / max(duration, 1)
+                
+                results.append({
+                    "device_id": device,
+                    "device_class": group["device_class"].iloc[0],
+                    "first_energy": group["energy"].iloc[0],
+                    "last_energy": group["energy"].iloc[-1],
+                    "consumption": max(0, consumption),  # Ensure non-negative
+                    "hourly_rate": hourly_rate,
+                    "duration_hours": duration,
+                    "has_resets": False,
+                    "has_gaps": False,
+                    "num_readings": len(group)
+                })
     
     result_df = pd.DataFrame(results)
     
@@ -228,7 +289,63 @@ def per_device_usage(df: pd.DataFrame) -> Tuple[pd.DataFrame, DataQualityMetrics
     if devices_with_resets:
         log.warning("Detected possible meter resets for %d devices", len(devices_with_resets))
         
-    return valid.round({"consumption": 2}), quality_metrics
+    if devices_with_gaps:
+        log.warning("Detected significant gaps in data for %d devices", len(devices_with_gaps))
+        
+    return valid.round({"consumption": 2, "hourly_rate": 4}), quality_metrics
+
+
+def calculate_time_weighted_consumption(df: pd.DataFrame) -> Tuple[float, float]:
+    """
+    Calculate time-weighted consumption for a device dataframe.
+    
+    Args:
+        df: DataFrame with timestamp, energy, energy_diff, and time_diff columns
+        
+    Returns:
+        Tuple of (consumption, duration_hours)
+    """
+    if len(df) < 2:
+        return 0.0, 0.0
+    
+    # Calculate point-to-point consumption and time differences
+    if "energy_diff" not in df.columns:
+        df = df.copy()
+        df["energy_diff"] = df["energy"].diff()
+        
+    if "time_diff" not in df.columns:
+        df = df.copy()
+        df["time_diff"] = df["timestamp"].diff().dt.total_seconds() / 3600  # in hours
+    
+    # Filter out negative energy differences (except for resets which are handled separately)
+    df_valid = df[(df["energy_diff"] >= 0) & (df["time_diff"] > 0)].copy()
+    
+    if df_valid.empty:
+        total_duration = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds() / 3600
+        consumption = max(0, df["energy"].iloc[-1] - df["energy"].iloc[0])
+        return consumption, total_duration
+    
+    # Calculate consumption rate for each interval (kWh/hour)
+    df_valid["rate"] = df_valid["energy_diff"] / df_valid["time_diff"]
+    
+    # Handle outliers in rates
+    q1, q3 = df_valid["rate"].quantile([0.25, 0.75])
+    iqr = q3 - q1
+    upper_bound = q3 + 3 * iqr
+    
+    # Cap extreme rates
+    if (df_valid["rate"] > upper_bound).any():
+        df_valid.loc[df_valid["rate"] > upper_bound, "rate"] = upper_bound
+        df_valid.loc[df_valid["rate"] > upper_bound, "energy_diff"] = df_valid["rate"] * df_valid["time_diff"]
+    
+    # Calculate total consumption and duration
+    total_consumption = df_valid["energy_diff"].sum()
+    total_duration = df_valid["time_diff"].sum()
+    
+    if total_duration < 1:  # Less than 1 hour of valid data
+        total_duration = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds() / 3600
+    
+    return total_consumption, total_duration
 
 
 def class_totals(dev_usage: pd.DataFrame) -> pd.DataFrame:
@@ -242,7 +359,11 @@ def class_totals(dev_usage: pd.DataFrame) -> pd.DataFrame:
 
 
 def daily_class(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate daily consumption by device class with improved handling of missing data."""
+    """
+    Calculate daily consumption by device class with time-weighted approach.
+    
+    Handles varying data transmission frequencies and gaps within each day.
+    """
     if df.empty:
         return pd.DataFrame()
         
@@ -250,29 +371,73 @@ def daily_class(df: pd.DataFrame) -> pd.DataFrame:
     # Extract date from timestamp while preserving timezone information
     df["date"] = df["timestamp"].dt.date
 
-    # Group by device, date, class and get first/last readings
-    dd = (
-        df.groupby(["device_id", "date", "device_class"])
-        .agg(first=("energy", "first"), last=("energy", "last"))
-        .reset_index()
-    )
+    # Create a copy of the dataframe for calculations
+    df_calc = df.copy()
     
-    # Calculate daily consumption with non-negative constraint
-    dd["delta"] = (dd["last"] - dd["first"]).clip(lower=0)
-
+    # Calculate time differences and energy differences for each device
+    daily_results = []
+    
+    for (device_id, date, device_class), group in df.groupby(["device_id", "date", "device_class"]):
+        if len(group) < 2:
+            # Need at least 2 readings to calculate consumption
+            continue
+            
+        # Sort by timestamp within the day
+        group = group.sort_values("timestamp")
+        
+        # Calculate time-weighted consumption for this device-day
+        group["energy_diff"] = group["energy"].diff()
+        group["time_diff"] = group["timestamp"].diff().dt.total_seconds() / 3600  # in hours
+        
+        # Filter out negative energy differences and zero time differences
+        valid_rows = group[(group["energy_diff"] >= 0) & (group["time_diff"] > 0)]
+        
+        if valid_rows.empty:
+            consumption = max(0, group["energy"].iloc[-1] - group["energy"].iloc[0])
+        else:
+            # Calculate consumption rate for each interval (kWh/hour)
+            valid_rows["rate"] = valid_rows["energy_diff"] / valid_rows["time_diff"]
+            
+            # Handle outliers in rates
+            q1, q3 = valid_rows["rate"].quantile([0.25, 0.75])
+            iqr = q3 - q1
+            upper_bound = q3 + 3 * iqr
+            
+            # Cap extreme rates
+            if (valid_rows["rate"] > upper_bound).any():
+                valid_rows.loc[valid_rows["rate"] > upper_bound, "rate"] = upper_bound
+                valid_rows.loc[valid_rows["rate"] > upper_bound, "energy_diff"] = valid_rows["rate"] * valid_rows["time_diff"]
+            
+            # Sum the energy differences for total consumption
+            consumption = valid_rows["energy_diff"].sum()
+        
+        daily_results.append({
+            "device_id": device_id,
+            "date": date,
+            "device_class": device_class,
+            "consumption": consumption
+        })
+    
+    dd = pd.DataFrame(daily_results)
+    
+    if dd.empty:
+        empty_df = pd.DataFrame(columns=["date"] + list(set(df["device_class"])))
+        empty_df["date"] = pd.date_range(WINDOW.start.date(), WINDOW.end.date(), freq="D")
+        return empty_df
+    
     # Handle potential anomalies (extremely high values)
     # Identify extreme outliers (more than 3 IQRs above Q3)
-    q1, q3 = dd["delta"].quantile([0.25, 0.75])
+    q1, q3 = dd["consumption"].quantile([0.25, 0.75])
     iqr = q3 - q1
     upper_bound = q3 + 3 * iqr
     
     # Cap extreme values
-    if (dd["delta"] > upper_bound).any():
-        log.warning("Capping %d extreme daily consumption values", (dd["delta"] > upper_bound).sum())
-        dd["delta"] = dd["delta"].clip(upper=upper_bound)
+    if (dd["consumption"] > upper_bound).any():
+        log.warning("Capping %d extreme daily consumption values", (dd["consumption"] > upper_bound).sum())
+        dd["consumption"] = dd["consumption"].clip(upper=upper_bound)
 
     # Sum by date and device class
-    daily = dd.groupby(["date", "device_class"])["delta"].sum().unstack(fill_value=0)
+    daily = dd.groupby(["date", "device_class"])["consumption"].sum().unstack(fill_value=0)
     
     # Use localized timestamps for date range
     idx_full = pd.date_range(
@@ -701,7 +866,11 @@ def bar_monthly_usage(month_df: pd.DataFrame):
 # ────────────────────────────────────────────────────────────────────────────────
 
 def daily_device(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate daily consumption for individual devices."""
+    """
+    Calculate daily consumption for individual devices using time-weighted approach.
+    
+    Handles varying data transmission frequencies and gaps within each day.
+    """
     if df.empty:
         return pd.DataFrame()
         
@@ -709,16 +878,30 @@ def daily_device(df: pd.DataFrame) -> pd.DataFrame:
     # Extract date from timestamp while preserving timezone information
     df["date"] = df["timestamp"].dt.date
 
-    # Group by device and date to get first/last readings
-    dd = (
-        df.groupby(["device_id", "date", "device_class"])
-        .agg(first=("energy", "first"), last=("energy", "last"))
-        .reset_index()
-    )
+    # Calculate time-weighted consumption for each device-day
+    daily_results = []
     
-    # Calculate daily consumption with non-negative constraint
-    dd["consumption"] = (dd["last"] - dd["first"]).clip(lower=0)
-
+    for (device_id, date, device_class), group in df.groupby(["device_id", "date", "device_class"]):
+        if len(group) < 2:
+            # Need at least 2 readings to calculate consumption
+            continue
+            
+        # Calculate time-weighted consumption for this device-day
+        consumption, duration = calculate_time_weighted_consumption(group)
+        
+        daily_results.append({
+            "device_id": device_id,
+            "date": date,
+            "device_class": device_class,
+            "consumption": consumption,
+            "duration_hours": duration
+        })
+    
+    dd = pd.DataFrame(daily_results)
+    
+    if dd.empty:
+        return pd.DataFrame()
+    
     # Handle potential anomalies (extremely high values)
     # Identify extreme outliers (more than 3 IQRs above Q3)
     q1, q3 = dd["consumption"].quantile([0.25, 0.75])
@@ -780,17 +963,30 @@ def weekday_device(daily_dev: pd.DataFrame) -> pd.DataFrame:
 def hourly_device_average(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
     """
     Average hourly consumption for individual devices, separated by weekday/weekend.
+    Uses time-weighted calculations to handle varying data transmission frequencies.
     Focuses on the top_n devices by total consumption to avoid overwhelming visualizations.
     """
     if df.empty:
         return pd.DataFrame()
     
-    # First, identify top devices by total consumption
-    device_totals = df.groupby("device_id")["energy"].agg(lambda x: x.max() - x.min()).sort_values(ascending=False)
-    top_devices = device_totals.head(top_n).index.tolist()
+    # First, identify top devices by total consumption using time-weighted approach
+    device_results = []
+    for device, group in df.groupby("device_id"):
+        if len(group) < 2:
+            continue
+        consumption, _ = calculate_time_weighted_consumption(group)
+        device_results.append({"device_id": device, "consumption": consumption})
+    
+    device_totals = pd.DataFrame(device_results)
+    if device_totals.empty:
+        return pd.DataFrame()
+        
+    top_devices = device_totals.sort_values("consumption", ascending=False).head(top_n)["device_id"].tolist()
     
     # Filter dataframe to only include top devices
     df_top = df[df["device_id"].isin(top_devices)].copy()
+    if df_top.empty:
+        return pd.DataFrame()
         
     # Date and time information
     df_top = df_top.sort_values(["device_id", "timestamp"])
@@ -799,31 +995,48 @@ def hourly_device_average(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
     # Add weekday/weekend flag
     df_top["is_weekend"] = df_top["timestamp"].dt.dayofweek >= 5  # 5=Saturday, 6=Sunday
 
-    # First/last energy values by device-day-hour
-    g = (
-        df_top.groupby(
-            ["device_id", "device_class", "date", "hour_of_day", "is_weekend"],
-            observed=True
-        )
-        .agg(first=("energy", "first"), last=("energy", "last"))
-        .reset_index()
-    )
-    g["delta"] = (g["last"] - g["first"]).clip(lower=0)
+    # Calculate time-weighted hourly consumption
+    hourly_results = []
+    
+    for (device_id, device_class, date, hour, is_weekend), group in df_top.groupby(
+        ["device_id", "device_class", "date", "hour_of_day", "is_weekend"]
+    ):
+        if len(group) < 2:
+            continue
+            
+        # Calculate time-weighted consumption for this hour
+        consumption, duration = calculate_time_weighted_consumption(group)
+        
+        if duration > 0.15:  # 0.15 hours = ~10 minutes
+            hourly_results.append({
+                "device_id": device_id,
+                "device_class": device_class,
+                "date": date,
+                "hour_of_day": hour,
+                "is_weekend": is_weekend,
+                "consumption": consumption,
+                "duration_hours": duration
+            })
+    
+    g = pd.DataFrame(hourly_results)
+    
+    if g.empty:
+        return pd.DataFrame()
     
     # Handle outliers in hourly data
-    q1, q3 = g["delta"].quantile([0.25, 0.75])
+    q1, q3 = g["consumption"].quantile([0.25, 0.75])
     iqr = q3 - q1
     upper_bound = q3 + 3 * iqr
     
     # Cap extreme values
-    if (g["delta"] > upper_bound).any():
-        log.warning("Capping %d extreme hourly consumption values", (g["delta"] > upper_bound).sum())
-        g["delta"] = g["delta"].clip(upper=upper_bound)
+    if (g["consumption"] > upper_bound).any():
+        log.warning("Capping %d extreme hourly consumption values", (g["consumption"] > upper_bound).sum())
+        g["consumption"] = g["consumption"].clip(upper=upper_bound)
 
     # Take average across days for each hour, weekend status, and device
     hourly = (
         g
-        .groupby(["device_id", "device_class", "hour_of_day", "is_weekend"], observed=True)["delta"]
+        .groupby(["device_id", "device_class", "hour_of_day", "is_weekend"], observed=True)["consumption"]
         .mean()
         .reset_index()
     )

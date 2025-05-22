@@ -54,7 +54,8 @@ DEFAULT_CONFIG = {
         "daily_aggregation": "sum",   # sum, mean
         "hourly_aggregation": "mean", # sum, mean
         "filter_negative_consumption": True,
-        "min_valid_readings": 5       # minimum number of readings for a device to be included
+        "min_valid_readings": 5,      # minimum number of readings for a device to be included
+        "gap_threshold_hours": 24     # threshold (in hours) for identifying significant gaps in data transmission
     }
 }
 
@@ -105,4 +106,4 @@ def _deep_update(source: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, An
             _deep_update(source[key], value)
         else:
             source[key] = value
-    return source 
+    return source  
