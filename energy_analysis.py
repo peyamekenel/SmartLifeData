@@ -928,8 +928,60 @@ def daily_device(df: pd.DataFrame) -> pd.DataFrame:
     if (result_df["consumption"] > upper_bound).any():
         log.warning("Capping %d extreme daily consumption values", (result_df["consumption"] > upper_bound).sum())
         result_df["consumption"] = result_df["consumption"].clip(upper=upper_bound)
+    
+    # Identify any remaining values exceeding historical max
+    result = result_df.sort_values(["device_id", "date"])
+    
+    # Process each device separately for spike detection
+    for device_id, device_data in result.groupby("device_id"):
+        if "hist_max" in device_data.columns and not device_data["hist_max"].isna().all():
+            device_max = device_data["hist_max"].iloc[0]  # Get the historical max for this device
+            
+            over_max_indices = device_data[(device_data["consumption"] > device_max * 1.1) & 
+                                         (~device_data["is_redistributed"])].index
+            if len(over_max_indices) > 0:
+                log.warning(f"Capping {len(over_max_indices)} values exceeding {device_max * 1.1:.2f} kWh for device {device_id}")
+                for idx in over_max_indices:
+                    result.loc[idx, "consumption"] = device_max
+                    result.loc[idx, "is_redistributed"] = True
+            
+            spike_indices = device_data[(device_data["consumption"] > device_max * 1.5) & 
+                                      (~device_data["is_redistributed"])].index
+            
+            for idx in spike_indices:
+                spike_date = result.loc[idx, "date"]
+                spike_value = result.loc[idx, "consumption"]
+                
+                log.warning(f"Post-processing: Found spike for {device_id} on {spike_date}: {spike_value:.2f} kWh")
+                
+                device_dates = device_data["date"].unique()
+                adjacent_dates = []
+                
+                for offset in [-1, 1]:
+                    target_date = spike_date + pd.Timedelta(days=offset)
+                    if target_date in device_dates:
+                        adjacent_dates.append(target_date)
+                
+                if adjacent_dates:
+                    # Calculate redistribution amount
+                    redistribution_days = len(adjacent_dates) + 1
+                    redistributed_value = spike_value / redistribution_days
+                    
+                    result.loc[idx, "consumption"] = redistributed_value
+                    result.loc[idx, "is_redistributed"] = True
+                    result.loc[idx, "was_gap"] = True
+                    
+                    for adj_date in adjacent_dates:
+                        adj_idx = result[(result["device_id"] == device_id) & 
+                                       (result["date"] == adj_date)].index
+                        if not adj_idx.empty:
+                            result.loc[adj_idx[0], "consumption"] += redistributed_value
+                            result.loc[adj_idx[0], "is_redistributed"] = True
+                            result.loc[adj_idx[0], "was_gap"] = True
+                    
+                    log.info(f"Redistributed spike of {spike_value:.2f} kWh over {redistribution_days} days for device {device_id}")
 
-    return result_df.round(2)
+    return result.round(2)
 
 
 def monthly_device(daily_dev: pd.DataFrame) -> pd.DataFrame:
@@ -1091,13 +1143,35 @@ def line_daily_device(daily_dev: pd.DataFrame, top_n: int = 5):
     # Filter to just the top devices
     plot_data = daily_dev[daily_dev["device_id"].isin(top_device_ids)].copy()
     
+    # Create separate DataFrames for regular and redistributed values
+    regular_data = plot_data[~plot_data["is_redistributed"]]
+    redistributed_data = plot_data[plot_data["is_redistributed"]]
+    
+    if not redistributed_data.empty:
+        redistributed_keys = redistributed_data[["device_id", "date"]].drop_duplicates()
+        regular_data = regular_data.merge(
+            redistributed_keys, 
+            on=["device_id", "date"], 
+            how="left", 
+            indicator=True
+        )
+        regular_data = regular_data[regular_data["_merge"] == "left_only"].drop("_merge", axis=1)
+    
+    combined_data = pd.concat([regular_data, redistributed_data])
+    
     # Create pivot table: dates as index, devices as columns
-    pivot_data = plot_data.pivot_table(
+    pivot_data = combined_data.pivot_table(
         index="date", 
         columns="device_id",
         values="consumption", 
         aggfunc="sum"
     ).fillna(0)
+    
+    window_size = 3
+    for device in pivot_data.columns:
+        pivot_data[device] = pivot_data[device].rolling(
+            window=window_size, center=True, min_periods=1
+        ).mean()
     
     # Get device classes for labeling
     device_classes = plot_data.groupby("device_id")["device_class"].first().to_dict()
@@ -1105,6 +1179,7 @@ def line_daily_device(daily_dev: pd.DataFrame, top_n: int = 5):
     # Create plot
     fig, ax = plt.subplots(figsize=(14, 8))
     
+    # Plot each device with improved styling
     for device in pivot_data.columns:
         device_class = device_classes[device]
         ax.plot(
