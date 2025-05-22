@@ -701,36 +701,137 @@ def bar_monthly_usage(month_df: pd.DataFrame):
 # ────────────────────────────────────────────────────────────────────────────────
 
 def daily_device(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate daily consumption for individual devices."""
+    """Calculate daily consumption for individual devices with gap detection and redistribution."""
     if df.empty:
         return pd.DataFrame()
         
     df = df.sort_values(["device_id", "timestamp"])
     # Extract date from timestamp while preserving timezone information
     df["date"] = df["timestamp"].dt.date
-
-    # Group by device and date to get first/last readings
-    dd = (
-        df.groupby(["device_id", "date", "device_class"])
-        .agg(first=("energy", "first"), last=("energy", "last"))
-        .reset_index()
-    )
     
-    # Calculate daily consumption with non-negative constraint
-    dd["consumption"] = (dd["last"] - dd["first"]).clip(lower=0)
-
+    gap_threshold = pd.Timedelta(hours=CONFIG["energy_analysis"].get("gap_threshold_hours", 24))
+    use_weighted = CONFIG["energy_analysis"].get("use_time_weighted_distribution", False)
+    log_redistributed = CONFIG["energy_analysis"].get("log_redistributed_intervals", True)
+    
+    # Process each device separately to handle transmission gaps
+    devices_processed = []
+    
+    for device_id, device_df in df.groupby("device_id"):
+        # Sort by timestamp
+        device_df = device_df.sort_values("timestamp")
+        device_class = device_df["device_class"].iloc[0]
+        
+        # Calculate time differences between consecutive readings
+        device_df = device_df.reset_index(drop=True)
+        time_diffs = device_df["timestamp"].diff()
+        
+        # Identify large gaps (exceeding threshold)
+        gap_indices = time_diffs[time_diffs > gap_threshold].index.tolist()
+        
+        if not gap_indices:
+            device_daily = (
+                device_df.groupby(["date"])
+                .agg(first=("energy", "first"), last=("energy", "last"))
+                .reset_index()
+            )
+            device_daily["device_id"] = device_id
+            device_daily["device_class"] = device_class
+            device_daily["consumption"] = (device_daily["last"] - device_daily["first"]).clip(lower=0)
+            device_daily["is_redistributed"] = False
+            devices_processed.append(device_daily)
+            continue
+            
+        # Process each segment (between gaps)
+        segments = []
+        start_idx = 0
+        
+        for gap_idx in gap_indices + [len(device_df)]:
+            segment = device_df.loc[start_idx:gap_idx-1]
+            
+            if not segment.empty and start_idx > 0:
+                gap_start_ts = device_df.loc[start_idx-1, "timestamp"]
+                gap_end_ts = device_df.loc[start_idx, "timestamp"]
+                gap_duration = gap_end_ts - gap_start_ts
+                
+                # Calculate consumption over the gap
+                gap_consumption = device_df.loc[start_idx, "energy"] - device_df.loc[start_idx-1, "energy"]
+                
+                if gap_consumption > 0:
+                    # Create a date range for the gap period
+                    gap_dates = pd.date_range(
+                        gap_start_ts.date() + pd.Timedelta(days=1),  # Start from next day
+                        gap_end_ts.date(),                           # End at gap end date
+                        freq="D"
+                    )
+                    
+                    if len(gap_dates) > 0:
+                        if use_weighted:
+                            daily_consumption = gap_consumption / len(gap_dates)
+                            distributed = pd.DataFrame({
+                                "date": gap_dates.date,
+                                "device_id": device_id,
+                                "device_class": device_class,
+                                "consumption": daily_consumption,
+                                "is_redistributed": True,
+                                "first": float('nan'),
+                                "last": float('nan')
+                            })
+                        else:
+                            daily_consumption = gap_consumption / len(gap_dates)
+                            distributed = pd.DataFrame({
+                                "date": gap_dates.date,
+                                "device_id": device_id,
+                                "device_class": device_class,
+                                "consumption": daily_consumption,
+                                "is_redistributed": True,
+                                "first": float('nan'),
+                                "last": float('nan')
+                            })
+                        
+                        segments.append(distributed)
+                        
+                        if log_redistributed:
+                            log.info(
+                                f"Redistributed {gap_consumption:.2f} kWh over {len(gap_dates)} days "
+                                f"for device {device_id} ({gap_start_ts.date()} to {gap_end_ts.date()})"
+                            )
+            
+            # Process regular daily consumption for this segment
+            if len(segment) > 0:
+                segment_daily = (
+                    segment.groupby(["date"])
+                    .agg(first=("energy", "first"), last=("energy", "last"))
+                    .reset_index()
+                )
+                segment_daily["device_id"] = device_id
+                segment_daily["device_class"] = device_class
+                segment_daily["consumption"] = (segment_daily["last"] - segment_daily["first"]).clip(lower=0)
+                segment_daily["is_redistributed"] = False
+                segments.append(segment_daily)
+                
+            start_idx = gap_idx
+        
+        if segments:
+            device_result = pd.concat(segments, ignore_index=True)
+            devices_processed.append(device_result)
+    
+    if not devices_processed:
+        return pd.DataFrame()
+        
+    result_df = pd.concat(devices_processed, ignore_index=True)
+    
     # Handle potential anomalies (extremely high values)
     # Identify extreme outliers (more than 3 IQRs above Q3)
-    q1, q3 = dd["consumption"].quantile([0.25, 0.75])
+    q1, q3 = result_df["consumption"].quantile([0.25, 0.75])
     iqr = q3 - q1
     upper_bound = q3 + 3 * iqr
     
     # Cap extreme values
-    if (dd["consumption"] > upper_bound).any():
-        log.warning("Capping %d extreme daily consumption values", (dd["consumption"] > upper_bound).sum())
-        dd["consumption"] = dd["consumption"].clip(upper=upper_bound)
+    if (result_df["consumption"] > upper_bound).any():
+        log.warning("Capping %d extreme daily consumption values", (result_df["consumption"] > upper_bound).sum())
+        result_df["consumption"] = result_df["consumption"].clip(upper=upper_bound)
 
-    return dd.round(2)
+    return result_df.round(2)
 
 
 def monthly_device(daily_dev: pd.DataFrame) -> pd.DataFrame:
@@ -1145,7 +1246,8 @@ def main(path: str | Path = "db16_db18_smartlife_feb15_apr15.json",
     # Save device-level data to CSV if requested
     if output_csv:
         if not daily_dev.empty:
-            daily_dev.to_csv(csv_dir / "daily_device_consumption.csv", index=False)
+            save_columns = [col for col in daily_dev.columns if col != 'is_redistributed']
+            daily_dev[save_columns].to_csv(csv_dir / "daily_device_consumption.csv", index=False)
         if not monthly_dev.empty:
             monthly_dev.to_csv(csv_dir / "monthly_device_consumption.csv", index=False)
         if not weekday_dev.empty:
